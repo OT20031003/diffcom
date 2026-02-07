@@ -89,7 +89,74 @@ def parse_args_and_config():
     np.random.seed(config.seed)  # Numpy module.
     random.seed(config.seed)  # Python random module.
     torch.manual_seed(config.seed)
+
+    # =========================================================================
+    # TAU-HARQ用の設定パラメータ
+    # =========================================================================
+    config.tau_harq = getattr(config, 'tau_harq', True)  # HARQを有効にするか
+    config.max_retries = getattr(config, 'max_retries', 3)  # 最大再送回数
+    config.tau_global = getattr(config, 'tau_global', 0.05)  # Global Decision用閾値
+    config.tau_local = getattr(config, 'tau_local', 0.1)     # Mask生成用閾値
+    config.calc_uncertainty = True  # 不確実性計算を強制的に有効化
+    config.uncertainty_perturbations = 5  # De Vitaの手法における摂動数 M
+    
+    # 【変更】固定間隔ではなく、割合で指定するためのパラメータ
+    # 例: 0.1 なら全ステップの10%ごと（つまり全工程で約10回計算）
+    config.uncertainty_interval_ratio = getattr(config, 'uncertainty_interval_ratio', 0.1)
+
     return config
+
+
+# =========================================================================
+# 再送シミュレーション関数 (Chase Combining)
+# =========================================================================
+def simulate_retransmission(operator, input_image, current_measurement, mask, retry_count, device):
+    """
+    HARQの再送シミュレーションを行い、Chase Combiningで信号を合成する。
+    
+    Args:
+        operator: DeepJSCC/NTSCC operator
+        input_image: 送信原画像 (Ground Truth)
+        current_measurement: 現在の受信信号辞書
+        mask: 再送が必要な領域 (1: retransmit, 0: keep)
+        retry_count: 現在の再送回数 (Combiningの重み付けに使用)
+    
+    Returns:
+        updated_measurement: 合成後の受信信号辞書
+    """
+    # 1. 新しい観測を実行 (新しいチャネルノイズが付加された信号を取得)
+    # シミュレーションとして全体を再送し、Chase Combiningを行う
+    new_obs = operator.observe_and_transpose(input_image)
+    
+    # 2. Chase Combining (信号の平均化: SNR改善)
+    # y_combined = (y_old * N + y_new) / (N + 1)
+    old_sig = current_measurement['ofdm_sig']
+    new_sig = new_obs['ofdm_sig']
+    
+    # 受信信号(シンボル)を平均化
+    combined_sig = (old_sig * retry_count + new_sig) / (retry_count + 1)
+    
+    # 3. 合成信号から画像を再度デコードして更新
+    if 'cof_est' in current_measurement:
+        cof = current_measurement['cof_est'] 
+    else:
+        cof = None
+        
+    s_hat = operator.transpose(combined_sig, cof)
+    
+    # デコーダの種類に応じた処理
+    if hasattr(operator, 'decode'):
+        x_mse_updated = operator.decode(s_hat)
+    else:
+         # NTSCC等、直接decodeが露出していない場合のフォールバック（簡易実装）
+         x_mse_updated = new_obs['x_mse'] 
+         
+    # 辞書の更新
+    updated_measurement = current_measurement.copy()
+    updated_measurement['ofdm_sig'] = combined_sig
+    updated_measurement['x_mse'] = x_mse_updated
+    
+    return updated_measurement
 
 
 def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method, dataloader, device, logger):
@@ -100,6 +167,10 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
         logger.info('【Config】: {}: {}'.format(key, value))
     logger.info('【Config】: channel_type: {}'.format(config.channel_type))
     logger.info('【Config】: CSNR: {}'.format(config.CSNR))
+    
+    # HARQの設定情報をログ出力
+    logger.info('【Config】: TAU-HARQ Enabled: {}, Max Retries: {}'.format(config.tau_harq, config.max_retries))
+
     # if config.channel_type == 'ofdm_tdl':
     ofdm_config = Config(config.ofdm_tdl)
     logger.info('【Config】: {} channel estimation'.format(ofdm_config.channel_est))
@@ -114,7 +185,11 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
         input_image, names = batch
         input_image = input_image.to(device)
         config.batch_size = input_image.shape[0]
+        
+        # Initial Transmission
         measurement = operator.observe_and_transpose(input_image)
+        
+        # Reset seeds logic (Original)
         torch.manual_seed(config.seed + 1)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(config.seed + 1)
@@ -123,195 +198,211 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
         random.seed(config.seed + 1)
         torch.manual_seed(config.seed + 1)
 
-        if config.channel_type == 'ofdm_tdl' and not (config.conditioning_method == 'blind_diffcom'):
-            H_loss_gt = torch.linalg.norm(measurement['cof_est'] - measurement["cof_gt"])
-            logger.info(f"batch{idx + 1:->4d}--> 【Init】 H_Loss cof_gt: {H_loss_gt:.4f}")
-            logger.info(f"batch{idx + 1:->4d}--> cof_gt: {measurement['cof_gt'].cpu().numpy()[..., :2]}")
-            logger.info(f"batch{idx + 1:->4d}--> 【Init】 cof_est: {measurement['cof_est'].cpu().numpy()[..., :2]}")
+        # =========================================================================
+        # HARQ 再送制御ループの開始
+        # =========================================================================
+        retry_count = 0
+        final_x_recon = None
+        
+        # 再送ループ: 最大回数に達するか、ACKが出るまで繰り返す
+        while retry_count <= config.max_retries:
+            logger.info(f"batch{idx + 1:->4d}--> HARQ Attempt {retry_count}/{config.max_retries}")
 
-        util.mkdir(config.save_path + '/measurement')
-        util.imsave_batch(util.tensor2uint_batch(measurement['x_mse']), names, config.save_path + '/measurement',
-                          f"measurement_")
-        baseline_metric = metric_wrapper(measurement['x_mse'], input_image)
-        logger.info(
-            f"batch{idx + 1:->4d}--> 【Baseline】"
-            f"CBR: {measurement['channel_usage'] / measurement['x_mse'].numel():.4f},"
-            f"PSNR: {baseline_metric['psnr']:.2f}dB, "
-            f"LPIPS: {baseline_metric['lpips']:.4f}, "
-            f"DISTS: {baseline_metric['dists']:.4f}, "
-            f"MSSSIM: {baseline_metric['msssim']:.4f}")
+            if config.channel_type == 'ofdm_tdl' and not (config.conditioning_method == 'blind_diffcom'):
+                H_loss_gt = torch.linalg.norm(measurement['cof_est'] - measurement["cof_gt"])
+                logger.info(f"batch{idx + 1:->4d}--> 【Init】 H_Loss cof_gt: {H_loss_gt:.4f}")
+                logger.info(f"batch{idx + 1:->4d}--> cof_gt: {measurement['cof_gt'].cpu().numpy()[..., :2]}")
+                logger.info(f"batch{idx + 1:->4d}--> 【Init】 cof_est: {measurement['cof_est'].cpu().numpy()[..., :2]}")
 
-        x_init = noise_schedule.sqrt_alphas_cumprod[noise_schedule.t_start] * (2 * measurement['x_mse'] - 1) + \
-                 noise_schedule.sqrt_1m_alphas_cumprod[
-                     noise_schedule.t_start] * torch.randn_like(input_image)
+            # フォルダ作成と観測画像の保存
+            util.mkdir(config.save_path + '/measurement')
+            util.imsave_batch(util.tensor2uint_batch(measurement['x_mse']), names, config.save_path + '/measurement',
+                              f"measurement_retry{retry_count}_") # ファイル名にretry回数を追加
+            
+            baseline_metric = metric_wrapper(measurement['x_mse'], input_image)
+            logger.info(
+                f"batch{idx + 1:->4d}--> 【Baseline (Retry {retry_count})】"
+                f"CBR: {measurement['channel_usage'] / measurement['x_mse'].numel():.4f},"
+                f"PSNR: {baseline_metric['psnr']:.2f}dB, "
+                f"LPIPS: {baseline_metric['lpips']:.4f}, "
+                f"DISTS: {baseline_metric['dists']:.4f}, "
+                f"MSSSIM: {baseline_metric['msssim']:.4f}")
 
-        if config.conditioning_method == 'blind_diffcom':
-            # plot measurement['cof_gt'] with matplotlib
-            plt.clf()
-            plt.figure(figsize=(4, 4))
-            font = {'family': 'serif', 'weight': 'normal', 'size': 12}
-            matplotlib.rc('font', **font)
-            ax = plt.gca()
-            BoundWidth = 1.5
-            ax.spines['bottom'].set_linewidth(BoundWidth)
-            ax.spines['left'].set_linewidth(BoundWidth)
-            ax.spines['top'].set_linewidth(BoundWidth)
-            ax.spines['right'].set_linewidth(BoundWidth)
-            cof_gt = measurement['cof_gt'][0, 0, :ofdm_config.L].cpu().numpy()
-            cof_gt_real = cof_gt.real
-            cof_gt_imag = cof_gt.imag
-            plt.scatter(cof_gt_real, cof_gt_imag,
-                        marker='x',
-                        color='r',
-                        s=80)
-            plt.xlim(-0.6, 0.6)
-            plt.ylim(-0.6, 0.6)
-            plt.xticks(np.arange(-0.6, 0.7, 0.2))
-            plt.yticks(np.arange(-0.6, 0.7, 0.2))
-            plt.grid()
-            util.mkdir(config.save_path + '/chart')
-            plt.savefig(config.save_path + '/chart/channel_response.png', bbox_inches='tight')
-            plt.close()
+            # Adaptive Initialization: 測定値(x_mse)に基づいて初期値 x_init を再計算
+            x_init = noise_schedule.sqrt_alphas_cumprod[noise_schedule.t_start] * (2 * measurement['x_mse'] - 1) + \
+                     noise_schedule.sqrt_1m_alphas_cumprod[
+                         noise_schedule.t_start] * torch.randn_like(input_image)
 
-            # channel response prior : L paths
-            power = torch.exp(-torch.arange(ofdm_config.L).float() / ofdm_config.decay).view(1, 1, ofdm_config.L).to(
-                device)
-            power = power / sum(power)
-            cof_init_real = torch.randn_like(measurement['cof_gt'][..., :ofdm_config.L]) * power
-            cof_init_imag = torch.randn_like(measurement['cof_gt'][..., :ofdm_config.L]) * power
-            cof_init = cof_init_real + 1j * cof_init_imag
-            cof_init = noise_schedule.sqrt_alphas_cumprod[noise_schedule.t_start] * cof_init + \
-                       noise_schedule.sqrt_1m_alphas_cumprod[noise_schedule.t_start] * torch.randn_like(cof_init)
-        else:
-            cof_gt = 0 + 0j
-            cof_init = measurement['cof_est']
+            if config.conditioning_method == 'blind_diffcom':
+                # plot measurement['cof_gt'] with matplotlib
+                plt.clf()
+                plt.figure(figsize=(4, 4))
+                font = {'family': 'serif', 'weight': 'normal', 'size': 12}
+                matplotlib.rc('font', **font)
+                ax = plt.gca()
+                BoundWidth = 1.5
+                ax.spines['bottom'].set_linewidth(BoundWidth)
+                ax.spines['left'].set_linewidth(BoundWidth)
+                ax.spines['top'].set_linewidth(BoundWidth)
+                ax.spines['right'].set_linewidth(BoundWidth)
+                cof_gt = measurement['cof_gt'][0, 0, :ofdm_config.L].cpu().numpy()
+                cof_gt_real = cof_gt.real
+                cof_gt_imag = cof_gt.imag
+                plt.scatter(cof_gt_real, cof_gt_imag,
+                            marker='x',
+                            color='r',
+                            s=80)
+                plt.xlim(-0.6, 0.6)
+                plt.ylim(-0.6, 0.6)
+                plt.xticks(np.arange(-0.6, 0.7, 0.2))
+                plt.yticks(np.arange(-0.6, 0.7, 0.2))
+                plt.grid()
+                util.mkdir(config.save_path + '/chart')
+                plt.savefig(config.save_path + '/chart/channel_response.png', bbox_inches='tight')
+                plt.close()
 
-        seq = noise_schedule.seq
-        # print(seq)
-        psnr_list = []
-        lpips_list = []
-        dists_list = []
-        L_m_list = []
-        H_loss_list = []
-        L_c_list = []
-        # reverse diffusion for one image from random noise
-        pbar = tqdm(range(len(seq)), ncols=140)
-        for i in pbar:
-            # curr_sigma = sigmas[seq[i]].cpu().numpy()
-            x_0_hat, h_0_hat, x_t, h_t, norm = cond_method(config, i, noise_schedule,
-                                                           x_init if i == 0 else x_t,
-                                                           cof_init if i == 0 else h_t,
-                                                           power if config.conditioning_method == 'blind_diffcom' else None,
-                                                           measurement, unet, diffusion, operator, loss_wrapper,
-                                                           last_timestep=(seq[i] == seq[-1]))
-
-            if (seq[i]) % config.diffcom_series['save_recon_every'] == 0:
-                save_path = os.path.join(config.save_path, f"recon")
-                util.mkdir(save_path)
-                util.mkdir(save_path + '/x_0^t')
-                torchvision.utils.save_image(x_0_hat / 2 + 0.5,
-                                             os.path.join(save_path + '/x_0^t', f"x_0^{seq[i].__str__().zfill(4)}.png"))
-
-                if config.conditioning_method == 'blind_diffcom':
-                    cof_hat = h_0_hat[0, 0, :ofdm_config.L].cpu().detach().numpy()
-                    cof_hat_real = cof_hat.real
-                    cof_hat_imag = cof_hat.imag
-
-                    # for l in range(ofdm_config.L):
-                    #     blind_data['h_est_real_{}'.format(l)].append(cof_hat_real[l])
-                    #     blind_data['h_est_imag_{}'.format(l)].append(cof_hat_imag[l])
-
-                    save_cof_path = os.path.join(config.save_path, f"recon/{names[0][:-4]}")
-                    util.mkdir(save_cof_path)
-                    torchvision.utils.save_image(x_0_hat / 2 + 0.5,
-                                                 os.path.join(save_cof_path, f"x_0^{seq[i].__str__().zfill(4)}.png"))
-                    save_cof_path = os.path.join(config.save_path, f"recon/{names[0][:-4]}_cof")
-                    util.mkdir(save_cof_path)
-                    # plot estimated channel response h_0_hat
-                    plt.clf()
-                    plt.figure(figsize=(4, 4))
-                    font = {'family': 'serif', 'weight': 'normal', 'size': 12}
-                    matplotlib.rc('font', **font)
-                    ax = plt.gca()
-                    BoundWidth = 1.5
-                    ax.spines['bottom'].set_linewidth(BoundWidth)
-                    ax.spines['left'].set_linewidth(BoundWidth)
-                    ax.spines['top'].set_linewidth(BoundWidth)
-                    ax.spines['right'].set_linewidth(BoundWidth)
-
-                    plt.scatter(cof_hat_real, cof_hat_imag,
-                                marker='o',
-                                s=80,
-                                # facecolor='none',
-                                color='c',
-                                zorder=1, label=r'$\hat{h}_{0|t}$')
-
-                    # cof_gt = measurement['cof_gt'][0, 0, :ofdm_config.L].cpu().numpy()
-                    # cof_gt_real = cof_gt.real
-                    # cof_gt_imag = cof_gt.imag
-                    # plt.scatter(cof_gt_real, cof_gt_imag, marker='x', label='$h^*$')
-                    plt.xlim(-0.6, 0.6)
-                    plt.ylim(-0.6, 0.6)
-                    plt.xticks(np.arange(-0.6, 0.7, 0.2))
-                    plt.yticks(np.arange(-0.6, 0.7, 0.2))
-                    plt.grid()
-                    plt.savefig(os.path.join(save_cof_path, f'cof_hat_{seq[i].__str__().zfill(4)}.png'),
-                                bbox_inches='tight')
-                    plt.close()
-
-            # calculate metrics
-            metrics = metric_wrapper((x_0_hat / 2 + 0.5).detach(), input_image)
-
-            if i > 100 and metrics['psnr'] < 6:
-                print('Failed to converge, Please check the reverse diffusion process.')
-                break
-
-            message = {'t_step': seq[i],
-                       'H_dist': 0.0,
-                       'L_m': norm['ofdm_sig'].item() if 'ofdm_sig' in norm.keys() else 0.0,
-                       'L_c': norm['x_mse'].item() if 'x_mse' in norm.keys() else 0.0,
-                       'PSNR': metrics['psnr'],
-                       'LPIPS': metrics['lpips'],
-                       'DISTS': metrics['dists']}
-            L_m_list.append(message['L_m'])
-            L_c_list.append(message['L_c'])
-
-            if config.channel_type == 'ofdm_tdl':
-                # L2 distance between estimated channel response and ground truth
-                message['H_dist'] = torch.linalg.norm(
-                    h_t[..., :ofdm_config.L] - measurement["cof_gt"][..., :ofdm_config.L]).item()
-                H_loss_list.append(message['H_dist'])
+                # channel response prior : L paths
+                power = torch.exp(-torch.arange(ofdm_config.L).float() / ofdm_config.decay).view(1, 1, ofdm_config.L).to(
+                    device)
+                power = power / sum(power)
+                cof_init_real = torch.randn_like(measurement['cof_gt'][..., :ofdm_config.L]) * power
+                cof_init_imag = torch.randn_like(measurement['cof_gt'][..., :ofdm_config.L]) * power
+                cof_init = cof_init_real + 1j * cof_init_imag
+                cof_init = noise_schedule.sqrt_alphas_cumprod[noise_schedule.t_start] * cof_init + \
+                           noise_schedule.sqrt_1m_alphas_cumprod[noise_schedule.t_start] * torch.randn_like(cof_init)
             else:
-                H_loss_list.append(0.0)
+                cof_gt = 0 + 0j
+                cof_init = measurement['cof_est']
 
-            pbar.set_postfix(message, refresh=True)
+            seq = noise_schedule.seq
+            
+            # 【追加】動的な不確実性計算間隔の設定
+            # 総ステップ数に対して指定した割合（例: 10%）ごとに計算するように interval を設定
+            # これにより SNR 等で steps が変動しても適切な頻度で計算される
+            total_steps = len(seq)
+            ratio = getattr(config, 'uncertainty_interval_ratio', 0.1) # デフォルト10%
+            config.uncertainty_interval = max(1, int(total_steps * ratio))
+            logger.info(f"  -> Uncertainty Calc Interval: {config.uncertainty_interval} steps (Total: {total_steps}, Ratio: {ratio})")
 
-            psnr_list.append(metrics['psnr'])
-            lpips_list.append(metrics['lpips'])
-            dists_list.append(metrics['dists'])
+            psnr_list = []
+            lpips_list = []
+            dists_list = []
+            L_m_list = []
+            H_loss_list = []
+            L_c_list = []
+            
+            # 不確実性集約用のリスト
+            uncertainty_list = []
 
-        # --------------------------------
-        # plot and save results
-        # --------------------------------
+            # reverse diffusion for one image from random noise
+            # HARQ試行ごとにプログレスバーを表示
+            pbar = tqdm(range(len(seq)), ncols=140, desc=f"Diffusing (Retry {retry_count})")
+            
+            x_t = x_init # Initialize for loop
+            h_t = cof_init
+            
+            for i in pbar:
+                # diffcom.py 側で config.uncertainty_interval を参照して計算頻度を制御する
+                # 戻り値: x_0_hat, h_0_hat, x_t, h_t, norm, uncertainty_map
+                ret_vals = cond_method(config, i, noise_schedule,
+                                       x_init if i == 0 else x_t,
+                                       cof_init if i == 0 else h_t,
+                                       power if config.conditioning_method == 'blind_diffcom' else None,
+                                       measurement, unet, diffusion, operator, loss_wrapper,
+                                       last_timestep=(seq[i] == seq[-1]))
+                
+                # 戻り値のアンパック
+                if len(ret_vals) == 6:
+                    x_0_hat, h_0_hat, x_t, h_t, norm, u_t = ret_vals
+                else:
+                     # フォールバック
+                    x_0_hat, h_0_hat, x_t, h_t, norm = ret_vals
+                    u_t = None
+                
+                # 時間方向の不確実性集約のためリストに追加 (計算された場合のみ)
+                if u_t is not None:
+                    uncertainty_list.append(u_t)
 
-        plt.clf()
-        font = {'family': 'serif', 'weight': 'normal', 'size': 12}
-        matplotlib.rc('font', **font)
-        ax = plt.gca()
-        BoundWidth = 1.5
-        ax.spines['bottom'].set_linewidth(BoundWidth)
-        ax.spines['left'].set_linewidth(BoundWidth)
-        ax.spines['top'].set_linewidth(BoundWidth)
-        ax.spines['right'].set_linewidth(BoundWidth)
-        plt.plot(L_m_list)
-        plt.xlabel('Timestep')
-        plt.ylabel('$\mathcal{L}_m$')
-        # plt.grid()
-        util.mkdir(config.save_path + '/chart')
-        plt.savefig(config.save_path + '/chart/L_Loss_{}.png'.format(idx), bbox_inches='tight')
-        plt.close()
+                if (seq[i]) % config.diffcom_series['save_recon_every'] == 0:
+                    save_path = os.path.join(config.save_path, f"recon")
+                    util.mkdir(save_path)
+                    util.mkdir(save_path + '/x_0^t')
+                    torchvision.utils.save_image(x_0_hat / 2 + 0.5,
+                                                 os.path.join(save_path + '/x_0^t', f"x_0^{seq[i].__str__().zfill(4)}.png"))
 
-        if config.conditioning_method == 'blind_diffcom':
+                    if config.conditioning_method == 'blind_diffcom':
+                        cof_hat = h_0_hat[0, 0, :ofdm_config.L].cpu().detach().numpy()
+                        cof_hat_real = cof_hat.real
+                        cof_hat_imag = cof_hat.imag
+
+                        save_cof_path = os.path.join(config.save_path, f"recon/{names[0][:-4]}")
+                        util.mkdir(save_cof_path)
+                        torchvision.utils.save_image(x_0_hat / 2 + 0.5,
+                                                     os.path.join(save_cof_path, f"x_0^{seq[i].__str__().zfill(4)}.png"))
+                        save_cof_path = os.path.join(config.save_path, f"recon/{names[0][:-4]}_cof")
+                        util.mkdir(save_cof_path)
+                        # plot estimated channel response h_0_hat
+                        plt.clf()
+                        plt.figure(figsize=(4, 4))
+                        font = {'family': 'serif', 'weight': 'normal', 'size': 12}
+                        matplotlib.rc('font', **font)
+                        ax = plt.gca()
+                        BoundWidth = 1.5
+                        ax.spines['bottom'].set_linewidth(BoundWidth)
+                        ax.spines['left'].set_linewidth(BoundWidth)
+                        ax.spines['top'].set_linewidth(BoundWidth)
+                        ax.spines['right'].set_linewidth(BoundWidth)
+
+                        plt.scatter(cof_hat_real, cof_hat_imag,
+                                    marker='o',
+                                    s=80,
+                                    # facecolor='none',
+                                    color='c',
+                                    zorder=1, label=r'$\hat{h}_{0|t}$')
+
+                        plt.xlim(-0.6, 0.6)
+                        plt.ylim(-0.6, 0.6)
+                        plt.xticks(np.arange(-0.6, 0.7, 0.2))
+                        plt.yticks(np.arange(-0.6, 0.7, 0.2))
+                        plt.grid()
+                        plt.savefig(os.path.join(save_cof_path, f'cof_hat_{seq[i].__str__().zfill(4)}.png'),
+                                    bbox_inches='tight')
+                        plt.close()
+
+                # calculate metrics
+                metrics = metric_wrapper((x_0_hat / 2 + 0.5).detach(), input_image)
+
+                if i > 100 and metrics['psnr'] < 6:
+                    print('Failed to converge, Please check the reverse diffusion process.')
+                    break
+
+                message = {'t_step': seq[i],
+                           'H_dist': 0.0,
+                           'L_m': norm['ofdm_sig'].item() if 'ofdm_sig' in norm.keys() else 0.0,
+                           'L_c': norm['x_mse'].item() if 'x_mse' in norm.keys() else 0.0,
+                           'PSNR': metrics['psnr'],
+                           'LPIPS': metrics['lpips'],
+                           'DISTS': metrics['dists']}
+                L_m_list.append(message['L_m'])
+                L_c_list.append(message['L_c'])
+
+                if config.channel_type == 'ofdm_tdl':
+                    # L2 distance between estimated channel response and ground truth
+                    message['H_dist'] = torch.linalg.norm(
+                        h_t[..., :ofdm_config.L] - measurement["cof_gt"][..., :ofdm_config.L]).item()
+                    H_loss_list.append(message['H_dist'])
+                else:
+                    H_loss_list.append(0.0)
+
+                pbar.set_postfix(message, refresh=True)
+
+                psnr_list.append(metrics['psnr'])
+                lpips_list.append(metrics['lpips'])
+                dists_list.append(metrics['dists'])
+
+            # --------------------------------
+            # plot and save results (ループ内の各試行で保存)
+            # --------------------------------
             plt.clf()
             font = {'family': 'serif', 'weight': 'normal', 'size': 12}
             matplotlib.rc('font', **font)
@@ -321,75 +412,142 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
             ax.spines['left'].set_linewidth(BoundWidth)
             ax.spines['top'].set_linewidth(BoundWidth)
             ax.spines['right'].set_linewidth(BoundWidth)
-            plt.plot(H_loss_list)
+            plt.plot(L_m_list)
             plt.xlabel('Timestep')
-            plt.ylabel('$\|\bm{h}^* - \bm{h}_{0|t} \|_2^2$')
+            plt.ylabel('$\mathcal{L}_m$')
             # plt.grid()
             util.mkdir(config.save_path + '/chart')
-            plt.savefig(config.save_path + '/chart/H_Loss_{}.png'.format(idx), bbox_inches='tight')
+            plt.savefig(config.save_path + '/chart/L_Loss_{}_try{}.png'.format(idx, retry_count), bbox_inches='tight')
             plt.close()
 
-        x_recon = (x_t / 2 + 0.5)
-        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-        axs[0].imshow(util.tensor2uint(x_recon[0]))
-        axs[0].set_title('Reconstructed')
-        axs[1].imshow(util.tensor2uint(input_image[0]))
-        axs[1].set_title('Ground Truth')
-        axs[2].imshow(util.tensor2uint(measurement['x_mse'][0]))
-        axs[2].set_title('Reconstruct with {} Decoder'.format(config.operator_name))
-        # remove the x and y ticks
-        for ax in axs:
-            ax.set_xticks([])
-            ax.set_yticks([])
-        # tight_layout automatically adjusts subplot params so that the subplot(s) fits in to the figure area.
-        plt.tight_layout()
-        plt.savefig(config.save_path + '/visual_compare_{}.png'.format(idx))
-        plt.close()
+            if config.conditioning_method == 'blind_diffcom':
+                plt.clf()
+                font = {'family': 'serif', 'weight': 'normal', 'size': 12}
+                matplotlib.rc('font', **font)
+                ax = plt.gca()
+                BoundWidth = 1.5
+                ax.spines['bottom'].set_linewidth(BoundWidth)
+                ax.spines['left'].set_linewidth(BoundWidth)
+                ax.spines['top'].set_linewidth(BoundWidth)
+                ax.spines['right'].set_linewidth(BoundWidth)
+                plt.plot(H_loss_list)
+                plt.xlabel('Timestep')
+                plt.ylabel('$\|\bm{h}^* - \bm{h}_{0|t} \|_2^2$')
+                # plt.grid()
+                util.mkdir(config.save_path + '/chart')
+                plt.savefig(config.save_path + '/chart/H_Loss_{}_try{}.png'.format(idx, retry_count), bbox_inches='tight')
+                plt.close()
 
-        delta_psnr = np.array(psnr_list)[1:] - np.array(psnr_list)[:-1]
-        delta_lpips = np.array(lpips_list)[1:] - np.array(lpips_list)[:-1]
-        fig, axs = plt.subplots(2, 3, figsize=(15, 10))
-        axs[0, 0].plot(psnr_list, label='PSNR_{}'.format(idx))
-        axs[0, 0].set_ylim(15, 30)
-        axs[0, 1].plot(np.array(lpips_list), label='LPIPS_{}'.format(idx))
-        axs[0, 1].set_ylim(0, 0.3)
-        axs[0, 2].plot(noise_schedule.log_SNRs.cpu().numpy()[::-1], '-', label='SNR')
-        axs[1, 0].plot(dists_list, label='DISTS_{}'.format(idx))
-        axs[1, 0].set_ylim(0, 0.3)
-        axs[1, 1].plot(delta_psnr, label='delta_PSNR_{}'.format(idx))
-        axs[1, 1].set_ylim(-0.1, 0.3)
-        axs[1, 2].plot(delta_lpips, label='delta_LPIPS_{}'.format(idx))
-        axs[1, 2].set_ylim(-0.05, 0.05)
-        plt.tight_layout()
+            x_recon = (x_t / 2 + 0.5)
+            final_x_recon = x_recon # 保存用に更新
 
-        for iter_x in range(2):
-            for iter_y in range(3):
-                axs[iter_x, iter_y].set_xlabel('timestep')
-                axs[iter_x, iter_y].set_xlim(0)
-                axs[iter_x, iter_y].legend()
-                axs[iter_x, iter_y].grid()
-        plt.savefig(config.save_path + '/chart/metric_curve_{}.png'.format(idx))
-        plt.close()
+            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+            axs[0].imshow(util.tensor2uint(x_recon[0]))
+            axs[0].set_title('Reconstructed')
+            axs[1].imshow(util.tensor2uint(input_image[0]))
+            axs[1].set_title('Ground Truth')
+            axs[2].imshow(util.tensor2uint(measurement['x_mse'][0]))
+            axs[2].set_title('Reconstruct with {} Decoder'.format(config.operator_name))
+            # remove the x and y ticks
+            for ax in axs:
+                ax.set_xticks([])
+                ax.set_yticks([])
+            # tight_layout automatically adjusts subplot params so that the subplot(s) fits in to the figure area.
+            plt.tight_layout()
+            plt.savefig(config.save_path + '/visual_compare_{}_try{}.png'.format(idx, retry_count))
+            plt.close()
+
+            delta_psnr = np.array(psnr_list)[1:] - np.array(psnr_list)[:-1]
+            delta_lpips = np.array(lpips_list)[1:] - np.array(lpips_list)[:-1]
+            fig, axs = plt.subplots(2, 3, figsize=(15, 10))
+            axs[0, 0].plot(psnr_list, label='PSNR_{}'.format(idx))
+            axs[0, 0].set_ylim(15, 30)
+            axs[0, 1].plot(np.array(lpips_list), label='LPIPS_{}'.format(idx))
+            axs[0, 1].set_ylim(0, 0.3)
+            axs[0, 2].plot(noise_schedule.log_SNRs.cpu().numpy()[::-1], '-', label='SNR')
+            axs[1, 0].plot(dists_list, label='DISTS_{}'.format(idx))
+            axs[1, 0].set_ylim(0, 0.3)
+            axs[1, 1].plot(delta_psnr, label='delta_PSNR_{}'.format(idx))
+            axs[1, 1].set_ylim(-0.1, 0.3)
+            axs[1, 2].plot(delta_lpips, label='delta_LPIPS_{}'.format(idx))
+            axs[1, 2].set_ylim(-0.05, 0.05)
+            plt.tight_layout()
+
+            for iter_x in range(2):
+                for iter_y in range(3):
+                    axs[iter_x, iter_y].set_xlabel('timestep')
+                    axs[iter_x, iter_y].set_xlim(0)
+                    axs[iter_x, iter_y].legend()
+                    axs[iter_x, iter_y].grid()
+            plt.savefig(config.save_path + '/chart/metric_curve_{}_try{}.png'.format(idx, retry_count))
+            plt.close()
+
+            # =========================================================================
+            # TAU-HARQ の判定ロジック
+            # =========================================================================
+            
+            # 1. 時間集約型不確実性 (TAU) の計算
+            if len(uncertainty_list) > 0:
+                uncertainty_stack = torch.stack(uncertainty_list, dim=0) # [T_sub, B, 1, H, W]
+                mean_uncertainty_map = torch.mean(uncertainty_stack, dim=0) # [B, 1, H, W]
+            else:
+                mean_uncertainty_map = torch.zeros_like(x_t)[:, 0:1, :, :]
+
+            # 2. Global Score の計算
+            global_score = torch.mean(mean_uncertainty_map).item()
+            logger.info(f"  -> HARQ Attempt {retry_count}: Global Uncertainty Score: {global_score:.5f} (Threshold: {config.tau_global})")
+
+            # 3. 再送判定 (Global Decision)
+            if not config.tau_harq or global_score <= config.tau_global or retry_count == config.max_retries:
+                # 終了条件: HARQ無効 OR 品質OK(ACK) OR 最大再送回数到達
+                if retry_count == config.max_retries and global_score > config.tau_global:
+                    logger.info("  -> Max retries reached. Accepting Best Effort.")
+                else:
+                    logger.info("  -> Quality Acceptable (ACK).")
+                break # ループを抜けて結果保存へ
+            else:
+                # 4. 再送要求 (NACK) と マスク生成
+                logger.info("  -> Quality Low (NACK). Retransmitting...")
+                
+                # 不確実性が高い領域を特定 (Mask Generation)
+                mask = (mean_uncertainty_map > config.tau_local).float()
+                coverage = mask.mean().item()
+                logger.info(f"  -> Retransmission Mask Coverage: {coverage:.2%}")
+                
+                # シミュレーションによる再送と信号合成 (Chase Combining)
+                measurement = simulate_retransmission(operator, input_image, measurement, mask, retry_count + 1, device)
+                
+                # 次の試行へ
+                retry_count += 1
+        
+        # =========================================================================
+        # HARQループ終了後の最終保存処理
+        # =========================================================================
 
         # --------------------------------
         # save plot
         # --------------------------------
-        metrics = metric_wrapper(x_recon.detach(), input_image)
+        metrics = metric_wrapper(final_x_recon.detach(), input_image)
         metrics['L_m'] = L_m_list[-1]
         metrics['L_c'] = L_c_list[-1]
         metrics['H_Loss'] = H_loss_list[-1]
+        
+        # HARQ関連のメトリクスを記録
+        metrics['Retries'] = retry_count
+        
         results.update(metrics)
         logger.info(
-            f"batch{idx + 1:->4d}--> 【Recon】"
+            f"batch{idx + 1:->4d}--> 【Final Recon】"
             f'H_Loss: {H_loss_list[-1]:.4f},'
             f'L_m: {L_m_list[-1]:.4f},'
             f'L_c: {L_c_list[-1]:.4f},'
             f"PSNR: {metrics['psnr']:.2f}dB, LPIPS: {metrics['lpips']:.4f}, "
-            f"DISTS: {metrics['dists']:.4f}, MSSSIM: {metrics['msssim']:.4f}")
+            f"DISTS: {metrics['dists']:.4f}, MSSSIM: {metrics['msssim']:.4f}, "
+            f"Retries: {retry_count}")
         logger.info('--------------------------------------------')
-        recon_image = util.tensor2uint_batch(x_recon)
+        recon_image = util.tensor2uint_batch(final_x_recon)
         util.imsave_batch(recon_image, names, config.save_path + '/recon',
-                          f"{config.model_name}_")
+                          f"{config.model_name}_final_") # ファイル名変更
 
     # --------------------------------
     # Average PSNR and LPIPS for all images
@@ -415,6 +573,10 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
     logger.info(
         '-----------> Average Confirming Loss L_c of {}, SNR: {}dB: {}'.format(config.testset_name, config.CSNR,
                                                                                results.avg['L_c']))
+    
+    # 平均再送回数の表示
+    logger.info('-----------> Average Retries: {}'.format(results.avg['Retries']))
+
     logger.info('-----------> Results Save to {}'.format(config.save_path))
     return results
 
@@ -425,7 +587,7 @@ def main():
     config.device = device
 
     # set up logger
-    logger_name = config.result_name
+    logger_name = config.result_name + "_HARQ" # ログ名にHARQを追加
     utils_logger.logger_info(logger_name, log_path=os.path.join(config.save_path, logger_name + '.log'))
     logger = logging.getLogger(logger_name)
     dataloader = get_test_loader(config.testsets_path, batch_size=config.batch_size, shuffle=False)
