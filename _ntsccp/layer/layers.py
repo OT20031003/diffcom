@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from natten import NeighborhoodAttention2D
+# from natten import NeighborhoodAttention2D
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_, Mlp
 from torch import Tensor
 

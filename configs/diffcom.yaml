@@ -1,4 +1,4 @@
-conditioning_method: 'hifi_diffcom'  # 'diffcom', 'hifi_diffcom', 'blind_diffcom'
+conditioning_method: 'diffcom'  # 'diffcom', 'hifi_diffcom', 'blind_diffcom'
 
 # config forward operator
 operator_name: 'djscc'  # 'ntscc', 'swinjscc'
@@ -19,7 +19,7 @@ djscc:
 
 #channel_type: 'awgn' # 'ofdm_tdl', 'awgn'
 channel_type: 'awgn'
-CSNR: 10
+CSNR: 0
 ofdm_tdl:
   P: 1
   S: 16
@@ -42,7 +42,7 @@ ofdm_tdl:
 
 # for ffhq dataset
 model_name: ffhq_10m  # diffcom (djscc) GPU memory ≈ 5404MB
-testset_name: ffhq_demo
+testset_name: ffhq_demo_100
 #testset_name: ffhq_test
 
 

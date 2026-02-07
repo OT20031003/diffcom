@@ -1,0 +1,14 @@
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.ckpt
+results
+testsets/*
+_djscc/ckpt/*.pt
+*.pt
+*.pt
+*Zone*
+model_zoo/*.pt*
+results/*
