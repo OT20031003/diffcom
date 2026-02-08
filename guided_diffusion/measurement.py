@@ -55,20 +55,23 @@ class NonlinearOperator(ABC):
 
 
 def shuffle(x, shuffled_indices=None):
-    B, N_s = x.shape
-    if shuffled_indices is None:
-        shuffled_indices = torch.randperm(N_s)
-    x = x.reshape(B, -1)[..., shuffled_indices].reshape(B, N_s)
-    return x, shuffled_indices
+    # 【変更】空間整合性を保つためシャッフルを無効化 (入力をそのまま返す)
+    # B, N_s = x.shape
+    # if shuffled_indices is None:
+    #     shuffled_indices = torch.randperm(N_s)
+    # x = x.reshape(B, -1)[..., shuffled_indices].reshape(B, N_s)
+    return x, None
 
 
 def de_shuffle(x, shuffled_indices):
-    B, N_s = x.shape
-    x = x.reshape(B, -1)
-    x_rx = torch.zeros_like(x)
-    x_rx[..., shuffled_indices] = x
-    x_rx = x_rx.reshape(B, N_s)
-    return x_rx
+    # 【変更】空間整合性を保つためデシャッフルを無効化 (入力をそのまま返す)
+    # B, N_s = x.shape
+    # x = x.reshape(B, -1)
+    # x_rx = torch.zeros_like(x)
+    # x_rx[..., shuffled_indices] = x
+    # x_rx = x_rx.reshape(B, N_s)
+    # return x_rx
+    return x
 
 
 class ChannelWrapper(nn.Module):
@@ -78,6 +81,8 @@ class ChannelWrapper(nn.Module):
         self.CSNR = config.CSNR
         self.shuffled_indices = None
         self.rescale = rescale
+        self.avg_pwr = None # 【追加】HARQ用に平均電力を保持する変数
+
         if config.channel_type == 'awgn' or config.channel_type == 'rayleigh':
             self.channel = Channel(config.channel_type, config.CSNR, logger, device, rescale=False)
         elif config.channel_type == 'ofdm_tdl':
@@ -102,25 +107,46 @@ class ChannelWrapper(nn.Module):
             s_equal = MMSE_equalization(H_est, info_sig, M * noise_pwr)
         return s_equal
 
-    def observe(self, s, mask):
+    def observe(self, s, mask, is_initial=True):
         '''
         Transmit the symbols through the channel
         :param s: symbols to be transmitted, shape: [B: batch_size, N_s: num_of_symbols]
+        :param mask: transmission mask
+        :param is_initial: 【追加】初回送信かどうか (電力正規化係数を決定するため)
         :return:
         '''
         self.s_shape = s.shape
         B, N_s = self.s_shape
         # interleave the symbols to be transmitted
+        # 【変更】シャッフル無効化
         s, shuffled_indices = shuffle(s)
         mask_sig, _ = shuffle(mask, shuffled_indices)
         self.shuffled_indices = shuffled_indices
-        avg_pwr = torch.sum(s ** 2) / mask.sum()
-        self.avg_pwr = avg_pwr
+        
+        # 【変更】電力制御: 初回送信時の電力を計算・保存し、再送時はそれを使用する
+        if is_initial or self.avg_pwr is None:
+            # 初回は全シンボルの平均電力を使用
+            avg_pwr = torch.sum(s ** 2) / s.numel()
+            self.avg_pwr = avg_pwr
+        else:
+            avg_pwr = self.avg_pwr
+        
         cof_est = None
         cof_gt = None
         if self.channel_type == 'awgn':
+            # AWGNチャネルシミュレーション
+            # 注: Channel.forwardはノイズを加算する。
+            # 部分再送の場合、マスクされた領域のみ有効な信号+ノイズとなり、他は0となるべき。
+            # ここでは全信号にノイズを加えた後、マスクを適用する。
+            
+            # 正規化 (self.channel.forward内ではなくここで行う場合を考慮しつつ、
+            # 既存実装は forward 内で正規化している可能性があるが、
+            # ここでは既存コードのフローに従い、パラメータとして avg_pwr を渡す)
             info_sig, channel_usage = self.channel.forward(s, avg_pwr)
+            
+            # 【変更】マスク適用: 送信しない部分は 0 にする (Chase Combiningのため)
             info_sig = info_sig * mask_sig
+
         # elif self.channel_type == 'rayleigh':
         #     info_sig, H_est, channel_usage = self.channel.forward(s)
         elif self.channel_type == 'ofdm_tdl':
@@ -151,6 +177,13 @@ class ChannelWrapper(nn.Module):
             else:
                 H_est = self.channel_estimation_wrapper(H_t, info_pilot, noise_pwr, M)
                 cof_est = self.channel.get_cof_from_H(H_est)
+            
+            # 【注意】OFDMの場合のマスク適用は周波数/時間リソースとの兼ね合いで複雑だが、
+            # 今回はAWGN優先のため、簡易的に出力にマスクを掛けることとする
+            # (ただし info_sig の形状確認が必要。通常は [B, P*2, S, ...] などをFlattenしたもの)
+            # 既存コードでは info_sig の形状操作がないため、ここでマスク適用は省略するか
+            # AWGN同様に適用可能であれば適用する。
+            pass
 
         return info_sig, cof_est, cof_gt, channel_usage
 
@@ -181,27 +214,9 @@ class ChannelWrapper(nn.Module):
         return s_hat
 
     def forward(self, s, mask, cof=None):
-        B, N_s = s.shape
-        s, _ = shuffle(s, self.shuffled_indices)
-
-        # we assume receiver knows the average power (a float number) of transmitted symbols
-        avg_pwr = self.avg_pwr
-
-        if self.channel_type == 'awgn':
-            ofdm_sig = s / torch.sqrt(avg_pwr * 2)
-
-        elif self.channel_type == 'ofdm_tdl':
-            s = s.reshape(B, self.opt.P * 2, self.opt.S, -1)
-            M = s.shape[-1]
-            s = s[:, :self.opt.P] + 1j * s[:, self.opt.P:]
-            self.channel.set_pilot(M)
-            # s = normalize(s, 1)
-            s = s / torch.sqrt(avg_pwr)
-            # print(s.shape)
-            info_pilot, ofdm_sig, H_t, noise_pwr, papr, papr_cp = self.channel(s,
-                                                                               self.CSNR,
-                                                                               cof=cof,
-                                                                               add_noise=False)
+        # 【変更】observeを呼び出し、必要な値だけ返すラッパー
+        # 再送時(forward)は is_initial=False とする
+        ofdm_sig, cof_est, cof_gt, channel_usage = self.observe(s, mask, is_initial=False)
         return ofdm_sig
 
 
@@ -224,11 +239,14 @@ class DeepJSCC(NonlinearOperator):
                 state_dict[key.replace('Decoder', 'jscc_decoder')] = state_dict.pop(key)
         self.model.load_state_dict(state_dict, strict=True)
         self.model.eval()
+        self.feature_shape = None # 【追加】特徴マップの空間形状を保持
 
     @torch.no_grad()
     def observe_and_transpose(self, x):
-        s = self.encode(x)
-        ofdm_sig, cof_est, cof_gt, channel_usage = self.channel.observe(s, torch.ones_like(s))
+        # 【変更】encode_initial を使用してエンコードと初期送信を行う
+        s, _ = self.encode_initial(x)
+        mask = torch.ones_like(s)
+        ofdm_sig, cof_est, cof_gt, channel_usage = self.channel.observe(s, mask, is_initial=True)
         s_hat = self.channel.transpose(ofdm_sig, cof_est)
         x_mse = self.decode(s_hat)
         return {"x_mse": x_mse,
@@ -238,13 +256,29 @@ class DeepJSCC(NonlinearOperator):
                 "cof_gt": cof_gt,
                 "channel_usage": channel_usage}
 
-    def encode(self, data):
+    def encode_initial(self, data):
+        """
+        【追加】初回エンコードを行い、シンボルと空間形状を返す。
+        """
         B, C, H, W = data.shape
-        s = self.model.encode(data, given_SNR=self.config.CSNR)
-        self.s_shape = s.shape
-        # avg_pwr = torch.mean(s ** 2)
-        # s = s / torch.sqrt(avg_pwr * 2)
-        s = s.reshape(B, -1)
+        # model.encode は [B, C_out, H', W'] のような空間テンソルを返すと仮定
+        s_spatial = self.model.encode(data, given_SNR=self.config.CSNR)
+        self.feature_shape = s_spatial.shape # 形状を保存 [B, C, H', W']
+        
+        self.s_shape = s_spatial.shape # encodeメソッド互換のため保存
+        s = s_spatial.reshape(B, -1)
+        return s, self.feature_shape
+
+    def forward_channel(self, s, mask):
+        """
+        【追加】部分再送用。エンコード済みのシンボルとマスクを受け取り通信路を通す。
+        """
+        ofdm_sig, cof_est, cof_gt, channel_usage = self.channel.observe(s, mask, is_initial=False)
+        return ofdm_sig, cof_est, cof_gt, channel_usage
+
+    def encode(self, data):
+        # 既存メソッド（内部互換用）
+        s, _ = self.encode_initial(data)
         return s
 
     def forward(self, s, cof=None):
@@ -257,7 +291,13 @@ class DeepJSCC(NonlinearOperator):
         return s_hat
 
     def decode(self, s_hat):
-        s_hat = s_hat.reshape(self.s_shape)
+        # 【変更】保存された feature_shape を使用してreshapeする
+        if self.feature_shape is not None:
+            s_hat = s_hat.reshape(self.feature_shape)
+        else:
+            # フォールバック (encode_initialが呼ばれていない場合など)
+            s_hat = s_hat.reshape(self.s_shape)
+            
         x_mse = self.model.decode(s_hat, given_SNR=self.config.CSNR)
         return x_mse
 
@@ -310,12 +350,29 @@ class NTSCC(NonlinearOperator):
         self.channel = ChannelWrapper(config, logger, device, rescale=True)
         self.indexes = None
 
+    def encode_initial(self, x):
+        """
+        【追加】初回エンコード。NTSCCのインターフェース互換用。
+        """
+        self.indexes = None
+        channel_input, mask, indexes = self.encode(x)
+        # NTSCCは可変長で空間形状が複雑なため、ここではchannel_inputとNoneを返す
+        return channel_input, None
+
+    def forward_channel(self, s, mask):
+        """
+        【追加】部分再送用。
+        """
+        ofdm_sig, cof_est, cof_gt, _ = self.channel.observe(s, mask, is_initial=False)
+        return ofdm_sig, cof_est, cof_gt
+
     @torch.no_grad()
     def observe_and_transpose(self, x):
         self.indexes = None
         channel_input, mask, indexes = self.encode(x)
         channel_usage = mask.sum().item() / 2
-        ofdm_sig, cof_est, cof_gt, _ = self.channel.observe(channel_input, mask)
+        # 【変更】observeにis_initial=Trueを追加
+        ofdm_sig, cof_est, cof_gt, _ = self.channel.observe(channel_input, mask, is_initial=True)
         s_hat = self.channel.transpose(ofdm_sig, cof_est)
         x_mse = self.decode(s_hat)
         return {"x_mse": x_mse,

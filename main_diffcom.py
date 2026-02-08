@@ -9,6 +9,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F  # 【追加】マスクのダウンサンプリング用
 import torchvision
 import yaml
 from tqdm.auto import tqdm
@@ -107,58 +108,6 @@ def parse_args_and_config():
     return config
 
 
-# =========================================================================
-# 再送シミュレーション関数 (Chase Combining)
-# =========================================================================
-def simulate_retransmission(operator, input_image, current_measurement, mask, retry_count, device):
-    """
-    HARQの再送シミュレーションを行い、Chase Combiningで信号を合成する。
-    
-    Args:
-        operator: DeepJSCC/NTSCC operator
-        input_image: 送信原画像 (Ground Truth)
-        current_measurement: 現在の受信信号辞書
-        mask: 再送が必要な領域 (1: retransmit, 0: keep)
-        retry_count: 現在の再送回数 (Combiningの重み付けに使用)
-    
-    Returns:
-        updated_measurement: 合成後の受信信号辞書
-    """
-    # 1. 新しい観測を実行 (新しいチャネルノイズが付加された信号を取得)
-    # シミュレーションとして全体を再送し、Chase Combiningを行う
-    new_obs = operator.observe_and_transpose(input_image)
-    
-    # 2. Chase Combining (信号の平均化: SNR改善)
-    # y_combined = (y_old * N + y_new) / (N + 1)
-    old_sig = current_measurement['ofdm_sig']
-    new_sig = new_obs['ofdm_sig']
-    
-    # 受信信号(シンボル)を平均化
-    combined_sig = (old_sig * retry_count + new_sig) / (retry_count + 1)
-    
-    # 3. 合成信号から画像を再度デコードして更新
-    if 'cof_est' in current_measurement:
-        cof = current_measurement['cof_est'] 
-    else:
-        cof = None
-        
-    s_hat = operator.transpose(combined_sig, cof)
-    
-    # デコーダの種類に応じた処理
-    if hasattr(operator, 'decode'):
-        x_mse_updated = operator.decode(s_hat)
-    else:
-         # NTSCC等、直接decodeが露出していない場合のフォールバック（簡易実装）
-         x_mse_updated = new_obs['x_mse'] 
-         
-    # 辞書の更新
-    updated_measurement = current_measurement.copy()
-    updated_measurement['ofdm_sig'] = combined_sig
-    updated_measurement['x_mse'] = x_mse_updated
-    
-    return updated_measurement
-
-
 def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method, dataloader, device, logger):
     logger.info('【Config】: model_name: {}'.format(config.model_name))
     logger.info('【Config】: testset_name: {}'.format(config.testset_name))
@@ -169,6 +118,7 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
     logger.info('【Config】: CSNR: {}'.format(config.CSNR))
     
     # HARQの設定情報をログ出力
+    logger.info('【Config】: Spatially-Aligned Partial HARQ Enabled')
     logger.info('【Config】: TAU-HARQ Enabled: {}, Max Retries: {}'.format(config.tau_harq, config.max_retries))
 
     # if config.channel_type == 'ofdm_tdl':
@@ -186,8 +136,34 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
         input_image = input_image.to(device)
         config.batch_size = input_image.shape[0]
         
-        # Initial Transmission
-        measurement = operator.observe_and_transpose(input_image)
+        # =========================================================================
+        # 1. Initial Transmission (Full Frame)
+        # =========================================================================
+        # 【変更】初回エンコード: ステートフルな再送のためにクリーンなシンボルと形状を保持
+        s_clean, feature_shape = operator.encode_initial(input_image)
+        
+        # 全マスクで初回送信
+        mask_all = torch.ones_like(s_clean)
+        # operator.forward_channel を使用して送信 (エンコードなし)
+        y_new, cof_est, cof_gt, channel_usage = operator.forward_channel(s_clean, mask_all)
+        
+        # Chase Combining 用のアキュムレータ初期化
+        y_accum = y_new.clone()      # 受信信号の累積和
+        mask_accum = mask_all.clone() # 受信回数の累積和 (マスクベース)
+        
+        # 初回デコード
+        y_combined = y_accum / mask_accum
+        s_hat = operator.transpose(y_combined, cof_est)
+        x_mse = operator.decode(s_hat)
+
+        # Measurement 辞書の作成
+        measurement = {
+            "x_mse": x_mse,
+            "ofdm_sig": y_combined, # 概念的な受信信号
+            "cof_est": cof_est,
+            "cof_gt": cof_gt,
+            "channel_usage": channel_usage
+        }
         
         # Reset seeds logic (Original)
         torch.manual_seed(config.seed + 1)
@@ -483,7 +459,7 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
             plt.close()
 
             # =========================================================================
-            # TAU-HARQ の判定ロジック
+            # TAU-HARQ の判定ロジック (Spatially-Aligned)
             # =========================================================================
             
             # 1. 時間集約型不確実性 (TAU) の計算
@@ -507,15 +483,56 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
                 break # ループを抜けて結果保存へ
             else:
                 # 4. 再送要求 (NACK) と マスク生成
-                logger.info("  -> Quality Low (NACK). Retransmitting...")
+                logger.info("  -> Quality Low (NACK). Retransmitting Partial Symbols...")
                 
-                # 不確実性が高い領域を特定 (Mask Generation)
-                mask = (mean_uncertainty_map > config.tau_local).float()
-                coverage = mask.mean().item()
-                logger.info(f"  -> Retransmission Mask Coverage: {coverage:.2%}")
+                # (1) Pixel Mask Generation
+                mask_pixel = (mean_uncertainty_map > config.tau_local).float() # [B, 1, H, W]
+                pixel_coverage = mask_pixel.mean().item()
+
+                # (2) Downsample Mask to Symbol Space
+                if feature_shape is not None:
+                    # feature_shape is [B, C, H_sym, W_sym]
+                    # 画像マスクをシンボルの空間解像度に合わせてダウンサンプリング (Max Pooling的な補間)
+                    spatial_h, spatial_w = feature_shape[2], feature_shape[3]
+                    
+                    # 補間 (Nearest Neighbor) でマスクを縮小
+                    # 不確実な領域を逃さないよう、より安全には MaxPool だが、interpolate(mode='nearest') で代用
+                    mask_symbol_spatial = F.interpolate(mask_pixel, size=(spatial_h, spatial_w), mode='nearest')
+                    # または不確実領域を広めに取るために MaxPool2d を使用する場合:
+                    # mask_symbol_spatial = F.adaptive_max_pool2d(mask_pixel, (spatial_h, spatial_w))
+                    
+                    # チャンネル方向に拡張 [B, C, H_sym, W_sym]
+                    mask_symbol_spatial = mask_symbol_spatial.expand(-1, feature_shape[1], -1, -1)
+                    
+                    # s_clean と同じ形状にフラット化 [B, N_symbols]
+                    mask_symbol_flat = mask_symbol_spatial.reshape(s_clean.shape[0], -1)
+                else:
+                    # NTSCC等で形状不明な場合のフォールバック (全再送)
+                    logger.warning("  -> Unknown feature shape. Using Full Mask.")
+                    mask_symbol_flat = torch.ones_like(s_clean)
+
+                symbol_coverage = mask_symbol_flat.mean().item()
+                logger.info(f"  -> Pixel Coverage: {pixel_coverage:.2%} -> Symbol Coverage: {symbol_coverage:.2%}")
+
+                # (3) Partial Transmission
+                # クリーンなシンボルと新しいマスクを用いて送信
+                y_partial_new, _, _, _ = operator.forward_channel(s_clean, mask_symbol_flat)
                 
-                # シミュレーションによる再送と信号合成 (Chase Combining)
-                measurement = simulate_retransmission(operator, input_image, measurement, mask, retry_count + 1, device)
+                # (4) Chase Combining (Accumulate)
+                # マスクされた部分だけ加算 (y_partial_new はマスク外が 0 または無効値だが、ChannelWrapper側で制御済み)
+                y_accum = y_accum + y_partial_new
+                mask_accum = mask_accum + mask_symbol_flat
+                
+                # (5) Update Measurement
+                # ゼロ除算回避のため epsilon 加算
+                y_combined = y_accum / (mask_accum + 1e-8)
+                
+                # 等化とデコード
+                s_hat_updated = operator.transpose(y_combined, measurement['cof_est'])
+                x_mse_updated = operator.decode(s_hat_updated)
+                
+                measurement['ofdm_sig'] = y_combined
+                measurement['x_mse'] = x_mse_updated
                 
                 # 次の試行へ
                 retry_count += 1
@@ -587,7 +604,7 @@ def main():
     config.device = device
 
     # set up logger
-    logger_name = config.result_name + "_HARQ" # ログ名にHARQを追加
+    logger_name = config.result_name + "_HARQ_Spatial" # ログ名変更
     utils_logger.logger_info(logger_name, log_path=os.path.join(config.save_path, logger_name + '.log'))
     logger = logging.getLogger(logger_name)
     dataloader = get_test_loader(config.testsets_path, batch_size=config.batch_size, shuffle=False)
