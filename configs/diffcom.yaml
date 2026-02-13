@@ -19,7 +19,7 @@ djscc:
 
 #channel_type: 'awgn' # 'ofdm_tdl', 'awgn'
 channel_type: 'awgn'
-CSNR: 0
+CSNR: 2
 ofdm_tdl:
   P: 1
   S: 16

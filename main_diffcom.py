@@ -96,7 +96,7 @@ def parse_args_and_config():
     # =========================================================================
     config.tau_harq = getattr(config, 'tau_harq', True)  # HARQを有効にするか
     config.max_retries = getattr(config, 'max_retries', 3)  # 最大再送回数
-    config.tau_global = getattr(config, 'tau_global', 0.05)  # Global Decision用閾値
+    config.tau_global = getattr(config, 'tau_global', 0.965)  # Global Decision用閾値
     config.tau_local = getattr(config, 'tau_local', 0.1)     # Mask生成用閾値
     config.calc_uncertainty = True  # 不確実性計算を強制的に有効化
     config.uncertainty_perturbations = 5  # De Vitaの手法における摂動数 M
