@@ -91,7 +91,7 @@ DeepJSCCの潜在空間分布を学習する拡散モデルを訓練します。
 このモデルは、**SNR（0dB〜20dB）を条件として受け取り**、DeepJSCCのエンコーダ出力  の分布を正確に模倣します。
 
 ```bash
-python train_latent_diffusion_v2.py \
+python train_latent_diffusion.py \
   --data_path ./testsets/ffhq_train_70k \
   --djscc_ckpt ./_djscc/ckpt/ADJSCC_C=2.pth.tar \
   --diffcom_config ./configs/diffcom.yaml \
@@ -111,7 +111,7 @@ nohup python train_latent_diffusion.py \
   --gpu_id 0 \
   > training.log 2>&1 &
 ```
-* **重要**: `train_latent_diffusion_v2.py` は、学習ループ内でランダムなSNRを生成し、`class_cond=True` を利用して拡散モデルに注入します。
+* **重要**: `train_latent_diffusion.py` は、学習ループ内でランダムなSNRを生成し、`class_cond=True` を利用して拡散モデルに注入します。
 
 ---
 
