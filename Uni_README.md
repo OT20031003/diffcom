@@ -90,6 +90,12 @@ djscc:
 DeepJSCCの潜在空間分布を学習する拡散モデルを訓練します。
 このモデルは、**SNR（0dB〜20dB）を条件として受け取り**、DeepJSCCのエンコーダ出力  の分布を正確に模倣します。
 
+
+
+### 1. 基本的な学習コマンド (新規開始)
+
+ターミナルで以下のコマンドを実行します。これが基本形です。
+
 ```bash
 python train_latent_diffusion.py \
   --data_path ./testsets/ffhq_train_70k \
@@ -97,12 +103,52 @@ python train_latent_diffusion.py \
   --diffcom_config ./configs/diffcom.yaml \
   --batch_size 32 \
   --epochs 100 \
-  --save_interval 10000 \
   --gpu_id 0
 
 ```
+
+**引数の説明:**
+
+* `--data_path`: 学習用データセット（画像フォルダ）のパス。
+* `--djscc_ckpt`: DeepJSCC（エンコーダ）の学習済み重みファイル。
+* `--diffcom_config`: 設定ファイル（チャンネル数などの読み込み用）。
+* `--batch_size`: 1回に処理する画像の枚数（GPUメモリに合わせて調整。32推奨）。
+* `--epochs`: 全データを何周学習するか。
+* `--gpu_id`: 使用するGPU番号（0, 1, 2...）。
+
+---
+
+### 2. 学習を途中から再開するコマンド (Resume)
+
+中断した学習を再開する場合は、`--resume_ckpt` オプションで保存されたチェックポイントファイルを指定します。
+
+```bash
+python train_latent_diffusion.py\
+  --data_path ./testsets/ffhq_train_70k \
+  --djscc_ckpt ./_djscc/ckpt/ADJSCC_C=2.pth.tar \
+  --diffcom_config ./configs/diffcom.yaml \
+  --batch_size 32 \
+  --epochs 100 \
+  --gpu_id 0 \
+  --resume_ckpt results/latent_diffusion_ckpt/checkpoint_50000.pt
+
 ```
-nohup python train_latent_diffusion.py \
+
+**ポイント:**
+
+* `results/latent_diffusion_ckpt/` フォルダ内に保存されている最新の `checkpoint_XXXXX.pt` を指定してください。
+* スクリプトは自動的にエポック数、ステップ数、オプティマイザの状態、Lossログの続きを認識して再開します。
+
+---
+
+### 3. バックグラウンドで実行するコマンド (推奨)
+
+学習には長時間かかるため、SSH接続が切れても止まらないように `nohup` コマンドを使うのが一般的です。
+
+#### 新規開始の場合
+
+```bash
+nohup python train_latent_diffusion.py\
   --data_path ./testsets/ffhq_train_70k \
   --djscc_ckpt ./_djscc/ckpt/ADJSCC_C=2.pth.tar \
   --diffcom_config ./configs/diffcom.yaml \
@@ -110,7 +156,67 @@ nohup python train_latent_diffusion.py \
   --epochs 100 \
   --gpu_id 0 \
   > training.log 2>&1 &
+
 ```
+
+#### 再開の場合
+
+```bash
+nohup python train_latent_diffusion.py\
+  --data_path ./testsets/ffhq_train_70k \
+  --djscc_ckpt ./_djscc/ckpt/ADJSCC_C=2.pth.tar \
+  --diffcom_config ./configs/diffcom.yaml \
+  --batch_size 32 \
+  --epochs 100 \
+  --gpu_id 0 \
+  --resume_ckpt results/latent_diffusion_ckpt/checkpoint_50000.pt \
+  >> training.log 2>&1 &
+
+```
+
+（`>>` にすることでログを上書きせず追記します）
+
+---
+
+### 4. 便利な補助コマンド
+
+学習中に状況を確認するためのコマンドです。
+
+* **ログのリアルタイム監視**:
+```bash
+tail -f training.log
+
+```
+
+
+* **GPU使用状況の確認**:
+```bash
+watch -n 1 nvidia-smi
+
+```
+
+
+* **プロセスの停止（強制終了）**:
+```bash
+# プロセスID (PID) を調べる
+ps -ef | grep train_latent
+
+# 停止する (12345はPID)
+kill 12345
+
+```
+
+
+* **Lossグラフの作成** (前回提供のスクリプトを使用):
+```bash
+python plot_loss.py
+
+```
+
+
+（`loss_curve.png` が生成され、Lossの減少傾向を視覚的に確認できます）
+
+
 * **重要**: `train_latent_diffusion.py` は、学習ループ内でランダムなSNRを生成し、`class_cond=True` を利用して拡散モデルに注入します。
 
 ---
