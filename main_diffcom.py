@@ -160,6 +160,7 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
         measurement = {
             "x_mse": x_mse,
             "ofdm_sig": y_combined, # 概念的な受信信号
+            "s_hat": s_hat,         # 【追加】受信シンボル（MSE計算用）
             "cof_est": cof_est,
             "cof_gt": cof_gt,
             "channel_usage": channel_usage
@@ -195,10 +196,14 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
             util.imsave_batch(util.tensor2uint_batch(measurement['x_mse']), names, config.save_path + '/measurement',
                               f"measurement_retry{retry_count}_") # ファイル名にretry回数を追加
             
+            # 【追加】シンボル自体の二乗誤差(MSE)を計算
+            symbol_mse = torch.mean((s_clean - measurement['s_hat']) ** 2).item()
+
             baseline_metric = metric_wrapper(measurement['x_mse'], input_image)
             logger.info(
                 f"batch{idx + 1:->4d}--> 【Baseline (Retry {retry_count})】"
-                f"CBR: {measurement['channel_usage'] / measurement['x_mse'].numel():.4f},"
+                f"CBR: {measurement['channel_usage'] / measurement['x_mse'].numel():.4f}, "
+                f"Symbol MSE: {symbol_mse:.6f}, " # 【追加】ログ出力
                 f"PSNR: {baseline_metric['psnr']:.2f}dB, "
                 f"LPIPS: {baseline_metric['lpips']:.4f}, "
                 f"DISTS: {baseline_metric['dists']:.4f}, "
@@ -533,6 +538,7 @@ def p_sample_loop(config, noise_schedule, unet, diffusion, operator, cond_method
                 
                 measurement['ofdm_sig'] = y_combined
                 measurement['x_mse'] = x_mse_updated
+                measurement['s_hat'] = s_hat_updated # 【追加】シンボルMSE計算用に更新
                 
                 # 次の試行へ
                 retry_count += 1
