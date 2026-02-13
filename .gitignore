@@ -12,3 +12,5 @@ _djscc/ckpt/*.pt
 *Zone*
 model_zoo/*.pt*
 results/*
+*.log
+
