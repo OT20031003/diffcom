@@ -191,7 +191,7 @@ tail -f training.log
 
 * **GPU使用状況の確認**:
 ```bash
-watch -n 1 nvidia-smi
+nvidia-smi
 
 ```
 
@@ -220,6 +220,21 @@ python plot_loss.py
 * **重要**: `train_latent_diffusion.py` は、学習ループ内でランダムなSNRを生成し、`class_cond=True` を利用して拡散モデルに注入します。
 
 ---
+
+## テスト
+```
+python test_latent_diffusion_metrics.py \
+    --djscc_ckpt _djscc/ckpt/ADJSCC_C=2.pth.tar \
+    --diffusion_ckpt results/latent_diffusion_ckpt/checkpoint_60000.pt \
+    --test_snr 1 \
+    --data_path testsets/ffhq_demo_100 \
+    --timestep_respacing 1000 \
+    --start_step 300 \
+    --end_step 0 
+```
+```
+rm -rf results/test_images
+```
 
 ## 🧪 推論とHARQ (Inference with HARQ)
 
