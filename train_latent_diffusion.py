@@ -234,7 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gpu_id", type=int, default=0)
-    parser.add_argument("--save_interval", type=int, default=2200) # 約1epochごとに保存
+    parser.add_argument("--save_interval", type=int, default=10000) # 約1epochごとに保存
     parser.add_argument("--learn_sigma", action='store_true', default=True, help="Whether to learn sigma")
     parser.add_argument("--resume_ckpt", type=str, default=None, help="Path to checkpoint to resume from")
     

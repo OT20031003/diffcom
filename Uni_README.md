@@ -167,9 +167,9 @@ nohup python train_latent_diffusion.py\
   --djscc_ckpt ./_djscc/ckpt/ADJSCC_C=2.pth.tar \
   --diffcom_config ./configs/diffcom.yaml \
   --batch_size 32 \
-  --epochs 100 \
+  --epochs 200 \
   --gpu_id 0 \
-  --resume_ckpt results/latent_diffusion_ckpt/checkpoint_50000.pt \
+  --resume_ckpt results/latent_diffusion_normalized_ckpt/checkpoint_55000.pt \
   >> training.log 2>&1 &
 
 ```
