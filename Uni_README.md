@@ -153,7 +153,7 @@ nohup python train_latent_diffusion.py\
   --djscc_ckpt ./_djscc/ckpt/ADJSCC_C=2.pth.tar \
   --diffcom_config ./configs/diffcom.yaml \
   --batch_size 32 \
-  --epochs 100 \
+  --epochs 200 \
   --gpu_id 0 \
   > training.log 2>&1 &
 
@@ -225,7 +225,7 @@ python plot_loss.py
 ```
 python test_latent_diffusion_metrics.py \
     --djscc_ckpt _djscc/ckpt/ADJSCC_C=2.pth.tar \
-    --diffusion_ckpt results/latent_diffusion_ckpt/checkpoint_60000.pt \
+    --diffusion_ckpt results/latent_diffusion_normailized_ckpt/checkpoint_60000.pt \
     --test_snr 1 \
     --data_path testsets/ffhq_demo_100 \
     --timestep_respacing 1000 \

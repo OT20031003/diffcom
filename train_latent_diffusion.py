@@ -173,7 +173,7 @@ def train(args):
                 current_batch_size = images.shape[0]
                 
                 # SNR Randomization
-                snr_int = torch.randint(-10, 21, (1,)).item()
+                snr_int = torch.randint(0, 21, (1,)).item()
                 
                 with torch.no_grad():
                     # 1. DeepJSCC Encode
@@ -201,7 +201,7 @@ def train(args):
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}", "SNR": f"{snr_int}dB"})
 
                 csv_writer.writerow([global_step, epoch, loss.item(), snr_int])
-
+                log_file.flush()
                 if global_step % args.save_interval == 0:
                     save_path = os.path.join(save_dir, f"checkpoint_{global_step}.pt")
                     torch.save({

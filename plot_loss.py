@@ -37,7 +37,7 @@ def plot_loss(log_file, output_img):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log_file", type=str, default="results/latent_diffusion_ckpt/loss_log.csv")
+    parser.add_argument("--log_file", type=str, default="results/latent_diffusion_normalized_ckpt/loss_log.csv")
     parser.add_argument("--output_img", type=str, default="loss_curve.png")
     args = parser.parse_args()
     
